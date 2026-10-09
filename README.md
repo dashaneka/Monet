@@ -8,6 +8,9 @@
 
 Monet does one thing: plays your videos and gets out of the way. Built with Rust, GTK4, libadwaita and GStreamer.
 
+![Monet playing Sintel](data/screenshot.png)
+<sub>Video: [Sintel](https://durian.blender.org) © Blender Foundation, CC BY 3.0</sub>
+
 ## What it does
 
 - Controls fade away while you watch
