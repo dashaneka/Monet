@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <path id="play" d="M46.4 21.9 L97.6 50.1 Q112 58 97.6 65.9 L46.4 94.1 Q32 102 32 86.2 L32 29.8 Q32 14 46.4 21.9 Z"/>
+    <clipPath id="play-clip">
+      <use href="#play"/>
+    </clipPath>
+  </defs>
+
+  <g transform="translate(2 -3)">
+    <circle cx="36" cy="92" r="22" fill="#e0a419" transform="translate(0 4)"/>
+    <use href="#play" fill="#5a41d6" transform="translate(0 4)"/>
+
+    <circle cx="36" cy="92" r="22" fill="#ffc53d"/>
+    <use href="#play" fill="#7b61ff"/>
+    <circle cx="36" cy="92" r="22" fill="#ff6f61" clip-path="url(#play-clip)"/>
+  </g>
+</svg>

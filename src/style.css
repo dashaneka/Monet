@@ -1,0 +1,19 @@
+.monet-video {
+  background-color: black;
+}
+
+headerbar.monet-header {
+  background: linear-gradient(to bottom, alpha(black, 0.6), transparent);
+  border-bottom: none;
+  box-shadow: none;
+  color: white;
+}
+
+.monet-toasts toast {
+  margin-bottom: 72px;
+}
+
+.monet-controls {
+  border-radius: 16px;
+  padding: 4px 8px;
+}
