@@ -77,3 +77,7 @@ sudo dnf swap libva-intel-media-driver intel-media-driver --allowerasing
 rm ~/.local/bin/monet ~/.local/share/applications/io.github.rajnish.Monet.desktop \
    ~/.local/share/icons/hicolor/scalable/apps/io.github.rajnish.Monet.svg
 ```
+
+## License
+
+[GPL-3.0-or-later](LICENSE). Use it, change it, share it.
