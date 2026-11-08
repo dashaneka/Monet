@@ -103,6 +103,8 @@ struct State {
     subtitle_source: Option<glib::SourceId>,
     subtitle_size: i32,
     track_toast: Option<adw::Toast>,
+    /// Keeps the screen on while playing.
+    inhibit_cookie: Option<u32>,
     last_saved: Option<Instant>,
     duration: Option<gst::ClockTime>,
     /// When the user last seeked, and to where (seconds).
@@ -570,9 +572,35 @@ impl Player {
         };
         self.play_button.set_icon_name(icon);
         self.play_button.set_tooltip_text(Some(tooltip));
+        self.keep_screen_on(playing);
         self.show_controls();
         if !playing {
             self.save_position();
+        }
+    }
+
+    /// Stops the screen from dimming, locking or idle-suspending mid-video.
+    fn keep_screen_on(&self, on: bool) {
+        let Some(app) = self.window.application() else {
+            return;
+        };
+        let cookie = self.state.borrow().inhibit_cookie;
+        match (on, cookie) {
+            (true, None) => {
+                let cookie = app.inhibit(
+                    Some(&self.window),
+                    gtk::ApplicationInhibitFlags::IDLE,
+                    Some("Playing a video"),
+                );
+                if cookie != 0 {
+                    self.state.borrow_mut().inhibit_cookie = Some(cookie);
+                }
+            }
+            (false, Some(cookie)) => {
+                app.uninhibit(cookie);
+                self.state.borrow_mut().inhibit_cookie = None;
+            }
+            _ => {}
         }
     }
 
@@ -1137,6 +1165,7 @@ impl Player {
 
     fn fail(&self, message: &str) {
         let _ = self.playbin.set_state(gst::State::Null);
+        self.keep_screen_on(false);
         if let Some(tick) = self.state.borrow_mut().tick_source.take() {
             tick.remove();
         }
@@ -1148,6 +1177,7 @@ impl Player {
     /// closes or another file replaces this one.
     pub fn shutdown(&self) {
         self.save_position();
+        self.keep_screen_on(false);
         let mut state = self.state.borrow_mut();
         if let Some(tick) = state.tick_source.take() {
             tick.remove();
@@ -1210,7 +1240,7 @@ fn secs(time: gst::ClockTime) -> f64 {
     time.nseconds() as f64 / 1e9
 }
 
-fn format_time(time: gst::ClockTime) -> String {
+pub fn format_time(time: gst::ClockTime) -> String {
     let total = time.seconds();
     let (h, m, s) = (total / 3600, (total / 60) % 60, total % 60);
     if h > 0 {

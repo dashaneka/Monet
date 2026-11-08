@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::player::{self, Player};
+use crate::{recent, resume};
 
 type Slot = Rc<RefCell<Option<Rc<Player>>>>;
 
@@ -90,7 +91,7 @@ pub fn new_window(app: &adw::Application, file: Option<&gio::File>) {
             );
         }
         None => {
-            show_empty(&window);
+            show_empty(&window, &slot);
             window.present();
         }
     }
@@ -133,6 +134,7 @@ fn load_at(window: &adw::ApplicationWindow, slot: &Slot, file: &gio::File, start
                     }
                 }
             };
+            recent::add(&uri);
             let player = Player::new(window, &title, &uri, playbin, &paintable, reload);
             player.start(start_at);
             *slot.borrow_mut() = Some(player);
@@ -200,7 +202,7 @@ fn show_page(window: &adw::ApplicationWindow, title: &str, page: &adw::StatusPag
     window.set_content(Some(&toolbar));
 }
 
-fn show_empty(window: &adw::ApplicationWindow) {
+fn show_empty(window: &adw::ApplicationWindow, slot: &Slot) {
     let open_button = gtk::Button::builder()
         .label("Open Video…")
         .action_name("win.open")
@@ -209,13 +211,66 @@ fn show_empty(window: &adw::ApplicationWindow) {
     open_button.add_css_class("pill");
     open_button.add_css_class("suggested-action");
 
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 36);
+    content.append(&open_button);
+    let recent = recent::list();
+    if !recent.is_empty() {
+        content.append(&recent_list(window, slot, &recent));
+    }
+
     let page = adw::StatusPage::builder()
         .icon_name("video-x-generic-symbolic")
         .title("Drop a Video Here")
         .description("Or open one from your files")
-        .child(&open_button)
+        .child(&content)
         .build();
+    if !recent.is_empty() {
+        page.add_css_class("compact");
+    }
     show_page(window, "Monet", &page);
+}
+
+fn recent_list(window: &adw::ApplicationWindow, slot: &Slot, items: &[gtk::RecentInfo]) -> adw::Clamp {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+    for item in items {
+        let file = gio::File::for_uri(&item.uri());
+        let subtitle = match resume::load(&item.uri()) {
+            Some(position) => {
+                let time = gst::ClockTime::from_seconds(position as u64);
+                format!("Resume at {}", player::format_time(time))
+            }
+            None => file
+                .parent()
+                .and_then(|dir| dir.basename())
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        let row = adw::ActionRow::builder()
+            .title(glib::markup_escape_text(&item.display_name()))
+            .subtitle(glib::markup_escape_text(&subtitle))
+            .activatable(true)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name("video-x-generic-symbolic"));
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.connect_activated(glib::clone!(
+            #[weak]
+            window,
+            #[strong]
+            slot,
+            move |_| load(&window, &slot, &file)
+        ));
+        list.append(&row);
+    }
+
+    let heading = gtk::Label::builder().label("Recent").halign(gtk::Align::Start).build();
+    heading.add_css_class("heading");
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    section.append(&heading);
+    section.append(&list);
+    adw::Clamp::builder().maximum_size(480).child(&section).build()
 }
 
 pub fn show_error(window: &adw::ApplicationWindow, title: &str, message: &str) {

@@ -14,7 +14,8 @@ Monet does one thing: plays your videos and gets out of the way. Built with Rust
 ## What it does
 
 - Controls fade away while you watch
-- Remembers where you stopped
+- Remembers where you stopped, and lists recent videos on the start screen
+- Keeps the screen awake while playing
 - Window takes the shape of the video (shorts stay tall)
 - Uses your GPU to decode when it can, falls back to CPU when it can't
 - Switch audio language and subtitles from the menu, or with `A` and `S`
