@@ -1,6 +1,7 @@
 mod decoders;
 mod player;
 mod resume;
+mod subfile;
 mod tracks;
 mod window;
 

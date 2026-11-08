@@ -34,11 +34,6 @@ impl Tracks {
         number_duplicates(&mut tracks.text, "Subtitles");
         tracks
     }
-
-    /// Worth showing a menu only when there is something to choose.
-    pub fn has_choices(&self) -> bool {
-        self.audio.len() > 1 || !self.text.is_empty()
-    }
 }
 
 /// "Hindi", "English", or the track's own title if it has no language.

@@ -79,7 +79,8 @@ pub fn new_window(app: &adw::Application, file: Option<&gio::File>) {
     match file {
         // The player shows the window once it knows the video's shape.
         Some(file) => {
-            load(&window, &slot, file);            glib::timeout_add_local_once(
+            load(&window, &slot, file);
+            glib::timeout_add_local_once(
                 SHOW_TIMEOUT,
                 glib::clone!(
                     #[weak]

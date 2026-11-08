@@ -13,6 +13,12 @@ headerbar.monet-header {
   margin-bottom: 72px;
 }
 
+.monet-subtitles {
+  color: white;
+  font-weight: 500;
+  text-shadow: 0 0 2px black, 0 0 4px black, 1px 1px 3px black;
+}
+
 .monet-controls {
   border-radius: 16px;
   padding: 4px 8px;

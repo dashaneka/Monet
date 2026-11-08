@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gst::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use crate::subfile::{self, SubtitleFile};
 use crate::tracks::Tracks;
 use crate::{decoders, resume, window};
 
@@ -23,6 +24,11 @@ const SEEK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SCREEN_SHARE: f64 = 0.7;
 const SEEK_STEP: f64 = 10.0;
 const VOLUME_STEP: f64 = 0.05;
+/// How often text from a subtitle file is updated.
+const SUBTITLE_TICK: Duration = Duration::from_millis(50);
+/// Menu ids of subtitle files are this plus their index; others are
+/// GStreamer stream ids.
+const FILE_ID: &str = "monet-file:";
 
 pub fn build_pipeline(uri: &str) -> Result<(gst::Element, gdk::Paintable), glib::BoolError> {
     let gtksink = gst::ElementFactory::make("gtk4paintablesink").build()?;
@@ -56,6 +62,9 @@ pub struct Player {
     toasts: adw::ToastOverlay,
     overlay: gtk::Overlay,
     picture: gtk::Picture,
+    /// Shows text from subtitle files.
+    subtitle_label: gtk::Label,
+    subtitle_files: Vec<SubtitleFile>,
     header_revealer: gtk::Revealer,
     controls_revealer: gtk::Revealer,
     play_button: gtk::Button,
@@ -86,8 +95,12 @@ struct State {
     reloading: bool,
     tracks: Tracks,
     audio: Option<String>,
-    /// None while subtitles are off.
+    /// Menu id of the subtitles showing; None while they're off.
     subtitle: Option<String>,
+    /// Index of the subtitle file showing, if one is.
+    subtitle_file: Option<usize>,
+    subtitle_source: Option<glib::SourceId>,
+    subtitle_size: i32,
     track_toast: Option<adw::Toast>,
     last_saved: Option<Instant>,
     duration: Option<gst::ClockTime>,
@@ -188,7 +201,26 @@ impl Player {
             .child(&controls)
             .build();
 
+        let subtitle_label = gtk::Label::builder()
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .justify(gtk::Justification::Center)
+            .use_markup(true)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .margin_start(24)
+            .margin_end(24)
+            .can_target(false)
+            .visible(false)
+            .build();
+        subtitle_label.add_css_class("monet-subtitles");
+        let subtitle_files = subfile::find(&gio::File::for_uri(uri))
+            .iter()
+            .filter_map(|path| SubtitleFile::load(path))
+            .collect();
+
         let overlay = gtk::Overlay::builder().child(&picture).build();
+        overlay.add_overlay(&subtitle_label);
         overlay.add_overlay(&header_revealer);
         overlay.add_overlay(&controls_revealer);
 
@@ -206,6 +238,8 @@ impl Player {
             toasts,
             overlay,
             picture: picture.clone(),
+            subtitle_label,
+            subtitle_files,
             header_revealer,
             controls_revealer,
             play_button,
@@ -222,6 +256,10 @@ impl Player {
             state: RefCell::default(),
         });
         player.connect_signals(&picture, &controls);
+        // A subtitle file next to the video was put there to be used.
+        if !player.subtitle_files.is_empty() {
+            player.show_subtitle(Some(file_id(0)));
+        }
         let this = player.this.clone();
         paintable.connect_invalidate_size(move |paintable| {
             if let Some(player) = this.upgrade() {
@@ -644,17 +682,27 @@ impl Player {
             }
             menu.append_section(Some("Audio"), &section);
         }
-        if !tracks.text.is_empty() {
+        let subtitles = self.subtitle_choices(&tracks);
+        if !subtitles.is_empty() {
             let section = gio::Menu::new();
             section.append_item(&menu_item("Off", "player.subtitle", ""));
-            for track in &tracks.text {
-                section.append_item(&menu_item(&track.label, "player.subtitle", &track.id));
+            for (id, label) in &subtitles {
+                section.append_item(&menu_item(label, "player.subtitle", id));
             }
             menu.append_section(Some("Subtitles"), &section);
         }
         self.tracks_button.set_menu_model(Some(&menu));
-        self.tracks_button.set_visible(tracks.has_choices());
+        self.tracks_button
+            .set_visible(tracks.audio.len() > 1 || !subtitles.is_empty());
         self.state.borrow_mut().tracks = tracks;
+    }
+
+    /// Subtitles to choose from, as (menu id, label): the video's own
+    /// tracks, then the files next to it.
+    fn subtitle_choices(&self, tracks: &Tracks) -> Vec<(String, String)> {
+        let embedded = tracks.text.iter().map(|t| (t.id.clone(), t.label.clone()));
+        let files = (self.subtitle_files.iter().enumerate()).map(|(i, f)| (file_id(i), f.name.clone()));
+        embedded.chain(files).collect()
     }
 
     fn tracks_selected(&self, streams: impl Iterator<Item = gst::Stream>) {
@@ -667,34 +715,113 @@ impl Player {
                 subtitle = id;
             }
         }
+        let file = self.state.borrow().subtitle_file;
+        if let Some(index) = file {
+            if subtitle.is_some() {
+                // GStreamer turned on one of the video's own tracks by
+                // default; a subtitle file is showing, so turn it off.
+                self.select_tracks(audio, Some(file_id(index)));
+                return;
+            }
+            subtitle = Some(file_id(index));
+        }
         self.audio_action
             .set_state(&audio.clone().unwrap_or_default().to_variant());
-        self.subtitle_action
-            .set_state(&subtitle.clone().unwrap_or_default().to_variant());
-        let mut state = self.state.borrow_mut();
-        state.audio = audio;
-        state.subtitle = subtitle;
+        self.state.borrow_mut().audio = audio;
+        self.show_subtitle(subtitle);
     }
 
     /// Switches tracks; the video track always stays selected.
     fn select_tracks(&self, audio: Option<String>, subtitle: Option<String>) {
         let ids = {
             let mut state = self.state.borrow_mut();
+            let embedded = subtitle.clone().filter(|id| file_index(id).is_none());
             let ids: Vec<String> = state
                 .tracks
                 .video
                 .iter()
                 .cloned()
                 .chain(audio.clone())
-                .chain(subtitle.clone())
+                .chain(embedded)
                 .collect();
             // Remember the request now so quick key presses build on it.
             state.audio = audio;
-            state.subtitle = subtitle;
             ids
         };
+        self.show_subtitle(subtitle);
         self.playbin
             .send_event(gst::event::SelectStreams::new(ids.iter().map(String::as_str)));
+    }
+
+    /// Marks subtitles as chosen, and draws them if they come from a file.
+    fn show_subtitle(&self, id: Option<String>) {
+        self.subtitle_action
+            .set_state(&id.clone().unwrap_or_default().to_variant());
+        let file = id.as_deref().and_then(file_index);
+        {
+            let mut state = self.state.borrow_mut();
+            state.subtitle = id;
+            if state.subtitle_file == file {
+                return;
+            }
+            state.subtitle_file = file;
+            if let Some(source) = state.subtitle_source.take() {
+                source.remove();
+            }
+            if file.is_some() {
+                let this = self.this.clone();
+                state.subtitle_source = Some(glib::timeout_add_local(SUBTITLE_TICK, move || {
+                    match this.upgrade() {
+                        Some(player) => {
+                            player.update_file_subtitle();
+                            glib::ControlFlow::Continue
+                        }
+                        None => glib::ControlFlow::Break,
+                    }
+                }));
+            }
+        }
+        self.update_file_subtitle();
+    }
+
+    fn update_file_subtitle(&self) {
+        let file = self.state.borrow().subtitle_file;
+        let text = file.and_then(|index| {
+            let time = self.current_position()?;
+            self.subtitle_files.get(index)?.text_at(time)
+        });
+        let Some(text) = text else {
+            self.subtitle_label.set_visible(false);
+            return;
+        };
+        if self.subtitle_label.label() != text {
+            self.subtitle_label.set_label(&text);
+        }
+        self.place_file_subtitle();
+        self.subtitle_label.set_visible(true);
+    }
+
+    /// Keeps file subtitles on the picture, sized to it, and above the
+    /// controls while they show.
+    fn place_file_subtitle(&self) {
+        let Some((shown_height, bar, _)) = self.shown_video() else {
+            return;
+        };
+        let mut margin = bar + shown_height * 0.05;
+        if self.controls_revealer.reveals_child() {
+            margin = margin.max(self.controls_revealer.height() as f64 + 8.0);
+        }
+        let margin = margin.round() as i32;
+        if self.subtitle_label.margin_bottom() != margin {
+            self.subtitle_label.set_margin_bottom(margin);
+        }
+        let size = ((shown_height * 0.05).clamp(16.0, 64.0) * gtk::pango::SCALE as f64) as i32;
+        if self.state.borrow().subtitle_size != size {
+            self.state.borrow_mut().subtitle_size = size;
+            let attributes = gtk::pango::AttrList::new();
+            attributes.insert(gtk::pango::AttrSize::new_size_absolute(size));
+            self.subtitle_label.set_attributes(Some(&attributes));
+        }
     }
 
     fn cycle_audio(&self) {
@@ -716,15 +843,15 @@ impl Player {
     fn cycle_subtitles(&self) {
         let (next, audio) = {
             let state = self.state.borrow();
-            let text = &state.tracks.text;
-            if text.is_empty() {
+            let choices = self.subtitle_choices(&state.tracks);
+            if choices.is_empty() {
                 return;
             }
-            let next = match text.iter().position(|t| Some(&t.id) == state.subtitle.as_ref()) {
-                None => text.first(),
-                Some(i) => text.get(i + 1),
+            let next = match choices.iter().position(|(id, _)| Some(id) == state.subtitle.as_ref()) {
+                None => choices.first(),
+                Some(i) => choices.get(i + 1),
             };
-            (next.map(|t| (t.id.clone(), t.label.clone())), state.audio.clone())
+            (next.cloned(), state.audio.clone())
         };
         let label = next.as_ref().map_or("Off", |(_, label)| label.as_str());
         self.announce_track(&format!("Subtitles: {label}"));
@@ -808,7 +935,8 @@ impl Player {
 
     fn breakpoint_changed(&self) {
         let narrow = self.window.current_breakpoint().is_some();
-        self.volume_scale.set_visible(!narrow);    }
+        self.volume_scale.set_visible(!narrow);
+    }
 
     fn pointer_moved(&self, x: f64, y: f64) {
         // GTK also reports "motion" when widgets change under a still pointer.
@@ -837,6 +965,9 @@ impl Player {
 
     /// Lifts subtitles above the controls while they show.
     fn place_subtitles(&self) {
+        if self.state.borrow().subtitle_file.is_some() {
+            self.place_file_subtitle();
+        }
         let Some(text) = self.text_overlay() else {
             return;
         };
@@ -850,25 +981,30 @@ impl Player {
     /// part of the controls covers the picture.
     fn subtitle_padding(&self) -> i32 {
         const DEFAULT: i32 = 25;
-        let paintable = self.picture.paintable();
-        let (Some(paintable), true) = (paintable, self.controls_revealer.reveals_child()) else {
+        let Some((shown_height, bar, video_height)) = self.shown_video() else {
             return DEFAULT;
         };
+        let covered = self.controls_revealer.height() as f64 - bar;
+        if !self.controls_revealer.reveals_child() || covered <= 0.0 {
+            return DEFAULT;
+        }
+        DEFAULT + (covered * video_height / shown_height).round() as i32
+    }
+
+    /// How tall the video shows inside the picture and the black bar below
+    /// it, in window pixels, plus the video's own height.
+    fn shown_video(&self) -> Option<(f64, f64, f64)> {
+        let paintable = self.picture.paintable()?;
         let (video_width, video_height) = (
             paintable.intrinsic_width() as f64,
             paintable.intrinsic_height() as f64,
         );
         let (width, height) = (self.picture.width() as f64, self.picture.height() as f64);
         if video_width <= 0.0 || video_height <= 0.0 || height <= 0.0 {
-            return DEFAULT;
+            return None;
         }
         let shown_height = height.min(width * video_height / video_width);
-        let bar = (height - shown_height) / 2.0;
-        let covered = self.controls_revealer.height() as f64 - bar;
-        if covered <= 0.0 {
-            return DEFAULT;
-        }
-        DEFAULT + (covered * video_height / shown_height).round() as i32
+        Some((shown_height, (height - shown_height) / 2.0, video_height))
     }
 
     fn schedule_hide(&self) {
@@ -974,7 +1110,8 @@ impl Player {
                 match resume_at {
                     Some(position) => self.resume_from(position),
                     None => self.seek_finished(),
-                }            }
+                }
+            }
             _ => {}
         }
     }
@@ -996,8 +1133,11 @@ impl Player {
         if let Some(tick) = state.tick_source.take() {
             tick.remove();
         }
-        if let Some(hide) = state.hide_source.take() {
-            hide.remove();
+        for source in [state.hide_source.take(), state.subtitle_source.take()]
+            .into_iter()
+            .flatten()
+        {
+            source.remove();
         }
         for handler in [state.fullscreen_handler.take(), state.breakpoint_handler.take()]
             .into_iter()
@@ -1027,6 +1167,14 @@ fn menu_item(label: &str, action: &str, target: &str) -> gio::MenuItem {
     let item = gio::MenuItem::new(Some(label), None);
     item.set_action_and_target_value(Some(action), Some(&target.to_variant()));
     item
+}
+
+fn file_id(index: usize) -> String {
+    format!("{FILE_ID}{index}")
+}
+
+fn file_index(id: &str) -> Option<usize> {
+    id.strip_prefix(FILE_ID)?.parse().ok()
 }
 
 fn time_label() -> gtk::Label {
