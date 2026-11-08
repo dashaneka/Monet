@@ -1,6 +1,7 @@
 mod decoders;
 mod player;
 mod resume;
+mod tracks;
 mod window;
 
 use adw::prelude::*;

@@ -17,6 +17,7 @@ Monet does one thing: plays your videos and gets out of the way. Built with Rust
 - Remembers where you stopped
 - Window takes the shape of the video (shorts stay tall)
 - Uses your GPU to decode when it can, falls back to CPU when it can't
+- Switch audio language and subtitles from the menu, or with `A` and `S`
 - Drag a video in, or press `Ctrl+O`
 
 ## Keys
@@ -27,6 +28,8 @@ Monet does one thing: plays your videos and gets out of the way. Built with Rust
 | `←` `→` | Back / forward 10 seconds |
 | `↑` `↓` | Volume |
 | `M` | Mute |
+| `A` | Next audio track |
+| `S` | Next subtitles (or off) |
 | `F` or double-click | Fullscreen |
 | `Esc` | Leave fullscreen |
 

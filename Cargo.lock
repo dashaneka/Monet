@@ -391,6 +391,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-tag"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "790d1c673da71c87e9648d98e96cdd785784ae948a9728b95b2c7c10f6f4ee61"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-tag-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-tag-sys"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae01f8c50fca5b69d7002337a4aefc81a3c5574da9232c80b5aaf2301b641647"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps 9.0.0",
+]
+
+[[package]]
 name = "gtk4"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,6 +564,7 @@ version = "0.1.0"
 dependencies = [
  "glib-unix",
  "gstreamer",
+ "gstreamer-tag",
  "gtk4",
  "libadwaita",
 ]

@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gst::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 
+use crate::tracks::Tracks;
 use crate::{decoders, resume, window};
 
 const HIDE_DELAY: Duration = Duration::from_secs(2);
@@ -54,12 +55,16 @@ pub struct Player {
     playbin: gst::Element,
     toasts: adw::ToastOverlay,
     overlay: gtk::Overlay,
+    picture: gtk::Picture,
     header_revealer: gtk::Revealer,
     controls_revealer: gtk::Revealer,
     play_button: gtk::Button,
     seek_scale: gtk::Scale,
     position_label: gtk::Label,
     duration_label: gtk::Label,
+    tracks_button: gtk::MenuButton,
+    audio_action: gio::SimpleAction,
+    subtitle_action: gio::SimpleAction,
     mute_button: gtk::Button,
     volume_scale: gtk::Scale,
     fullscreen_button: gtk::Button,
@@ -79,6 +84,11 @@ struct State {
     /// Whether that jump came from the saved positions and should be shown.
     announce_resume: bool,
     reloading: bool,
+    tracks: Tracks,
+    audio: Option<String>,
+    /// None while subtitles are off.
+    subtitle: Option<String>,
+    track_toast: Option<adw::Toast>,
     last_saved: Option<Instant>,
     duration: Option<gst::ClockTime>,
     /// When the user last seeked, and to where (seconds).
@@ -128,6 +138,24 @@ impl Player {
         seek_scale.set_hexpand(true);
         seek_scale.set_sensitive(false);
         let duration_label = time_label();
+        let tracks_button = gtk::MenuButton::builder()
+            .icon_name("media-view-subtitles-symbolic")
+            .tooltip_text("Audio & Subtitles")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        tracks_button.add_css_class("flat");
+        tracks_button.add_css_class("circular");
+        let audio_action = gio::SimpleAction::new_stateful(
+            "audio",
+            Some(glib::VariantTy::STRING),
+            &"".to_variant(),
+        );
+        let subtitle_action = gio::SimpleAction::new_stateful(
+            "subtitle",
+            Some(glib::VariantTy::STRING),
+            &"".to_variant(),
+        );
         let mute_button = icon_button("audio-volume-high-symbolic", "Mute");
         let volume_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
         volume_scale.set_value(1.0);
@@ -144,7 +172,12 @@ impl Player {
         controls.append(&position_label);
         controls.append(&seek_scale);
         controls.append(&duration_label);
+        controls.append(&tracks_button);
         controls.append(&mute_button);
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&audio_action);
+        actions.add_action(&subtitle_action);
+        controls.insert_action_group("player", Some(&actions));
         controls.append(&volume_scale);
         controls.append(&fullscreen_button);
 
@@ -172,12 +205,16 @@ impl Player {
             playbin,
             toasts,
             overlay,
+            picture: picture.clone(),
             header_revealer,
             controls_revealer,
             play_button,
             seek_scale,
             position_label,
             duration_label,
+            tracks_button,
+            audio_action,
+            subtitle_action,
             mute_button,
             volume_scale,
             fullscreen_button,
@@ -250,7 +287,8 @@ impl Player {
 
         let this = self.this.clone();
         self.seek_scale.connect_change_value(move |scale, _, value| {
-            if let Some(player) = this.upgrade() {                let value = value.clamp(0.0, scale.adjustment().upper());
+            if let Some(player) = this.upgrade() {
+                let value = value.clamp(0.0, scale.adjustment().upper());
                 {
                     let mut state = player.state.borrow_mut();
                     state.last_user_seek = Some(Instant::now());
@@ -270,6 +308,24 @@ impl Player {
 
         let toggle_fullscreen = self.with(Player::toggle_fullscreen);
         self.fullscreen_button.connect_clicked(move |_| toggle_fullscreen());
+
+        let this = self.this.clone();
+        self.audio_action.connect_activate(move |_, id| {
+            if let (Some(player), Some(id)) = (this.upgrade(), id.and_then(|id| id.str())) {
+                player.select_tracks(Some(id.to_owned()), player.state.borrow().subtitle.clone());
+            }
+        });
+        let this = self.this.clone();
+        self.subtitle_action.connect_activate(move |_, id| {
+            if let (Some(player), Some(id)) = (this.upgrade(), id.and_then(|id| id.str())) {
+                let subtitle = (!id.is_empty()).then(|| id.to_owned());
+                player.select_tracks(player.state.borrow().audio.clone(), subtitle);
+            }
+        });
+        // The open menu keeps the controls up; closing it restarts the timer.
+        let schedule_hide = self.with(Player::schedule_hide);
+        self.tracks_button
+            .connect_active_notify(move |_| schedule_hide());
 
         let fullscreen_changed = self.with(Player::fullscreen_changed);
         let handler = self
@@ -557,7 +613,14 @@ impl Player {
         self.show_controls();
     }
 
-    fn handle_key(&self, key: gdk::Key) -> bool {        match key.to_lower() {
+    fn handle_key(&self, key: gdk::Key) -> bool {
+        // Let an open track menu use the arrows, Space and Escape itself.
+        if self.tracks_button.is_active() {
+            return false;
+        }
+        match key.to_lower() {
+            gdk::Key::a => self.cycle_audio(),
+            gdk::Key::s => self.cycle_subtitles(),
             gdk::Key::space => self.toggle_play(),
             gdk::Key::Left => self.seek_by(-SEEK_STEP),
             gdk::Key::Right => self.seek_by(SEEK_STEP),
@@ -569,6 +632,112 @@ impl Player {
             _ => return false,
         }
         true
+    }
+
+    fn tracks_changed(&self, collection: &gst::StreamCollection) {
+        let tracks = Tracks::from_collection(collection);
+        let menu = gio::Menu::new();
+        if tracks.audio.len() > 1 {
+            let section = gio::Menu::new();
+            for track in &tracks.audio {
+                section.append_item(&menu_item(&track.label, "player.audio", &track.id));
+            }
+            menu.append_section(Some("Audio"), &section);
+        }
+        if !tracks.text.is_empty() {
+            let section = gio::Menu::new();
+            section.append_item(&menu_item("Off", "player.subtitle", ""));
+            for track in &tracks.text {
+                section.append_item(&menu_item(&track.label, "player.subtitle", &track.id));
+            }
+            menu.append_section(Some("Subtitles"), &section);
+        }
+        self.tracks_button.set_menu_model(Some(&menu));
+        self.tracks_button.set_visible(tracks.has_choices());
+        self.state.borrow_mut().tracks = tracks;
+    }
+
+    fn tracks_selected(&self, streams: impl Iterator<Item = gst::Stream>) {
+        let (mut audio, mut subtitle) = (None, None);
+        for stream in streams {
+            let id = stream.stream_id().map(String::from);
+            if stream.stream_type().contains(gst::StreamType::AUDIO) {
+                audio = id;
+            } else if stream.stream_type().contains(gst::StreamType::TEXT) {
+                subtitle = id;
+            }
+        }
+        self.audio_action
+            .set_state(&audio.clone().unwrap_or_default().to_variant());
+        self.subtitle_action
+            .set_state(&subtitle.clone().unwrap_or_default().to_variant());
+        let mut state = self.state.borrow_mut();
+        state.audio = audio;
+        state.subtitle = subtitle;
+    }
+
+    /// Switches tracks; the video track always stays selected.
+    fn select_tracks(&self, audio: Option<String>, subtitle: Option<String>) {
+        let ids = {
+            let mut state = self.state.borrow_mut();
+            let ids: Vec<String> = state
+                .tracks
+                .video
+                .iter()
+                .cloned()
+                .chain(audio.clone())
+                .chain(subtitle.clone())
+                .collect();
+            // Remember the request now so quick key presses build on it.
+            state.audio = audio;
+            state.subtitle = subtitle;
+            ids
+        };
+        self.playbin
+            .send_event(gst::event::SelectStreams::new(ids.iter().map(String::as_str)));
+    }
+
+    fn cycle_audio(&self) {
+        let (next, subtitle) = {
+            let state = self.state.borrow();
+            let audio = &state.tracks.audio;
+            if audio.len() < 2 {
+                return;
+            }
+            let current = audio.iter().position(|t| Some(&t.id) == state.audio.as_ref());
+            let next = &audio[current.map_or(0, |i| (i + 1) % audio.len())];
+            ((next.id.clone(), next.label.clone()), state.subtitle.clone())
+        };
+        self.select_tracks(Some(next.0), subtitle);
+        self.announce_track(&format!("Audio: {}", next.1));
+    }
+
+    /// Off, then each subtitle track in turn, then off again.
+    fn cycle_subtitles(&self) {
+        let (next, audio) = {
+            let state = self.state.borrow();
+            let text = &state.tracks.text;
+            if text.is_empty() {
+                return;
+            }
+            let next = match text.iter().position(|t| Some(&t.id) == state.subtitle.as_ref()) {
+                None => text.first(),
+                Some(i) => text.get(i + 1),
+            };
+            (next.map(|t| (t.id.clone(), t.label.clone())), state.audio.clone())
+        };
+        let label = next.as_ref().map_or("Off", |(_, label)| label.as_str());
+        self.announce_track(&format!("Subtitles: {label}"));
+        self.select_tracks(audio, next.map(|(id, _)| id));
+    }
+
+    /// One short message at a time, so quick presses don't queue up.
+    fn announce_track(&self, message: &str) {
+        let toast = adw::Toast::builder().title(message).timeout(2).build();
+        if let Some(previous) = self.state.borrow_mut().track_toast.replace(toast.clone()) {
+            previous.dismiss();
+        }
+        self.toasts.add_toast(toast);
     }
 
     fn detach_keys(&self) {
@@ -654,7 +823,52 @@ impl Player {
         self.header_revealer.set_reveal_child(true);
         self.controls_revealer.set_reveal_child(true);
         self.overlay.set_cursor(None);
+        self.place_subtitles();
         self.schedule_hide();
+    }
+
+    fn text_overlay(&self) -> Option<gst::Element> {
+        let bin = self.playbin.downcast_ref::<gst::Bin>()?;
+        bin.iterate_recurse()
+            .into_iter()
+            .flatten()
+            .find(|element| element.factory().is_some_and(|f| f.name() == "textoverlay"))
+    }
+
+    /// Lifts subtitles above the controls while they show.
+    fn place_subtitles(&self) {
+        let Some(text) = self.text_overlay() else {
+            return;
+        };
+        let padding = self.subtitle_padding();
+        if text.property::<i32>("ypad") != padding {
+            text.set_property("ypad", padding);
+        }
+    }
+
+    /// Bottom padding in video pixels: the overlay's default, plus whatever
+    /// part of the controls covers the picture.
+    fn subtitle_padding(&self) -> i32 {
+        const DEFAULT: i32 = 25;
+        let paintable = self.picture.paintable();
+        let (Some(paintable), true) = (paintable, self.controls_revealer.reveals_child()) else {
+            return DEFAULT;
+        };
+        let (video_width, video_height) = (
+            paintable.intrinsic_width() as f64,
+            paintable.intrinsic_height() as f64,
+        );
+        let (width, height) = (self.picture.width() as f64, self.picture.height() as f64);
+        if video_width <= 0.0 || video_height <= 0.0 || height <= 0.0 {
+            return DEFAULT;
+        }
+        let shown_height = height.min(width * video_height / video_width);
+        let bar = (height - shown_height) / 2.0;
+        let covered = self.controls_revealer.height() as f64 - bar;
+        if covered <= 0.0 {
+            return DEFAULT;
+        }
+        DEFAULT + (covered * video_height / shown_height).round() as i32
     }
 
     fn schedule_hide(&self) {
@@ -674,13 +888,14 @@ impl Player {
     fn hide_controls(&self) {
         {
             let state = self.state.borrow();
-            if !state.playing || state.over_controls {
+            if !state.playing || state.over_controls || self.tracks_button.is_active() {
                 return;
             }
         }
         self.header_revealer.set_reveal_child(false);
         self.controls_revealer.set_reveal_child(false);
         self.overlay.set_cursor_from_name(Some("none"));
+        self.place_subtitles();
     }
 
     fn update_position(&self) {
@@ -700,6 +915,9 @@ impl Player {
             self.seek_scale.set_value(secs(position));
             self.position_label.set_label(&format_time(position));
         }
+
+        // A track switch can bring a fresh overlay with default padding.
+        self.place_subtitles();
 
         let save_due = {
             let state = self.state.borrow();
@@ -742,6 +960,12 @@ impl Player {
                 self.state.borrow_mut().ended = true;
                 self.set_playing(false);
             }
+            gst::MessageView::StreamCollection(msg) => {
+                self.tracks_changed(&msg.stream_collection());
+            }
+            gst::MessageView::StreamsSelected(msg) => {
+                self.tracks_selected(msg.streams());
+            }
             gst::MessageView::DurationChanged(_) => {
                 self.state.borrow_mut().duration = None;
             }
@@ -750,8 +974,7 @@ impl Player {
                 match resume_at {
                     Some(position) => self.resume_from(position),
                     None => self.seek_finished(),
-                }
-            }
+                }            }
             _ => {}
         }
     }
@@ -798,6 +1021,12 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     button.add_css_class("flat");
     button.add_css_class("circular");
     button
+}
+
+fn menu_item(label: &str, action: &str, target: &str) -> gio::MenuItem {
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some(action), Some(&target.to_variant()));
+    item
 }
 
 fn time_label() -> gtk::Label {

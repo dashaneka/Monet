@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 gst = { package = "gstreamer", version = "0.25" }
+gst-tag = { package = "gstreamer-tag", version = "0.25" }
 glib-unix = "0.22"
 
 [profile.release]
