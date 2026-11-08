@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gst::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use crate::mpris::Mpris;
 use crate::subfile::{self, SubtitleFile};
 use crate::tracks::Tracks;
 use crate::{decoders, resume, window};
@@ -80,6 +81,8 @@ pub struct Player {
     loop_button: gtk::ToggleButton,
     /// Reopens the same file at a position, after hardware decoding failed.
     reload: Box<dyn Fn(f64)>,
+    /// Kept apart from `state`: answering D-Bus reads the state.
+    mpris: RefCell<Option<Mpris>>,
     state: RefCell<State>,
 }
 
@@ -265,9 +268,11 @@ impl Player {
             fullscreen_button,
             loop_button,
             reload: Box::new(reload),
+            mpris: RefCell::default(),
             state: RefCell::default(),
         });
         player.connect_signals(&picture, &controls);
+        *player.mpris.borrow_mut() = Mpris::new(player.this.clone());
         // A subtitle file next to the video was put there to be used.
         if !player.subtitle_files.is_empty() {
             player.show_subtitle(Some(file_id(0)));
@@ -358,6 +363,9 @@ impl Player {
 
         let toggle_fullscreen = self.with(Player::toggle_fullscreen);
         self.fullscreen_button.connect_clicked(move |_| toggle_fullscreen());
+
+        let loop_changed = self.with(|player| player.mpris_changed(&["LoopStatus"]));
+        self.loop_button.connect_toggled(move |_| loop_changed());
 
         let this = self.this.clone();
         self.audio_action.connect_activate(move |_, id| {
@@ -545,7 +553,7 @@ impl Player {
     }
 
     /// Where playback is, or is about to be once a pending seek lands.
-    fn current_position(&self) -> Option<f64> {
+    pub fn current_position(&self) -> Option<f64> {
         if self.seek_pending() {
             Some(self.state.borrow().seek_target)
         } else {
@@ -553,7 +561,7 @@ impl Player {
         }
     }
 
-    fn set_playing(&self, playing: bool) {
+    pub fn set_playing(&self, playing: bool) {
         if playing && self.state.borrow().ended {
             self.seek_to(0.0);
         }
@@ -577,6 +585,7 @@ impl Player {
         if !playing {
             self.save_position();
         }
+        self.mpris_changed(&["PlaybackStatus"]);
     }
 
     /// Stops the screen from dimming, locking or idle-suspending mid-video.
@@ -604,15 +613,48 @@ impl Player {
         }
     }
 
-    fn toggle_play(&self) {
+    pub fn toggle_play(&self) {
         let playing = self.state.borrow().playing;
         self.set_playing(!playing);
+    }
+
+    pub fn playing(&self) -> bool {
+        self.state.borrow().playing
+    }
+
+    pub fn duration(&self) -> Option<f64> {
+        self.state.borrow().duration.map(secs)
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn raise(&self) {
+        self.window.present();
+    }
+
+    pub fn quit(&self) {
+        self.window.close();
+    }
+
+    fn mpris_changed(&self, properties: &[&str]) {
+        if let Some(mpris) = self.mpris.borrow().as_ref() {
+            mpris.changed(self, properties);
+        }
     }
 
     /// Seeks to the exact time. Accurate seeks decode from the previous
     /// keyframe, so while one is in flight newer targets are queued and only
     /// the latest runs once it lands; dragging stays smooth without piling up.
     fn seek_to(&self, secs: f64) {
+        if let Some(mpris) = self.mpris.borrow().as_ref() {
+            mpris.seeked(secs);
+        }
         {
             let mut state = self.state.borrow_mut();
             state.ended = false;
@@ -654,7 +696,7 @@ impl Player {
         }
     }
 
-    fn seek_by(&self, delta: f64) {
+    pub fn seek_by(&self, delta: f64) {
         // A seek in flight hasn't moved the clock yet; build on its target so
         // rapid or held key presses accumulate instead of repeating.
         let pending = self.seek_pending().then(|| self.state.borrow().seek_target);
@@ -665,7 +707,12 @@ impl Player {
         }) else {
             return;
         };
-        let mut target = (base + delta).max(0.0);
+        self.jump_to(base + delta);
+    }
+
+    /// A seek the user asked for: the slider moves there right away.
+    pub fn jump_to(&self, target: f64) {
+        let mut target = target.max(0.0);
         if let Some(duration) = self.state.borrow().duration {
             target = target.min(secs(duration));
         }
@@ -915,9 +962,26 @@ impl Player {
 
     fn toggle_loop(&self) {
         let looping = !self.loop_button.is_active();
-        self.loop_button.set_active(looping);
+        self.set_looping(looping);
         self.announce(if looping { "Loop on" } else { "Loop off" });
         self.show_controls();
+    }
+
+    pub fn looping(&self) -> bool {
+        self.loop_button.is_active()
+    }
+
+    pub fn set_looping(&self, looping: bool) {
+        self.loop_button.set_active(looping);
+    }
+
+    /// The volume slider's position, 0 to 1.
+    pub fn volume(&self) -> f64 {
+        self.volume_scale.value()
+    }
+
+    pub fn set_volume(&self, volume: f64) {
+        self.volume_scale.set_value(volume);
     }
 
     fn toggle_mute(&self) {
@@ -942,6 +1006,7 @@ impl Player {
         } else {
             self.update_volume_icon();
         }
+        self.mpris_changed(&["Volume"]);
     }
 
     fn update_volume_icon(&self) {
@@ -1087,6 +1152,7 @@ impl Player {
             self.seek_scale.set_range(0.0, secs(duration).max(1.0));
             self.seek_scale.set_sensitive(true);
             self.duration_label.set_label(&format_time(duration));
+            self.mpris_changed(&["Metadata"]);
         }
 
         // Mid-seek the clock still reports the old spot; showing it would
@@ -1176,6 +1242,9 @@ impl Player {
     /// Stops playback and detaches from the window. Called when the window
     /// closes or another file replaces this one.
     pub fn shutdown(&self) {
+        if let Some(mpris) = self.mpris.borrow_mut().take() {
+            mpris.close();
+        }
         self.save_position();
         self.keep_screen_on(false);
         let mut state = self.state.borrow_mut();

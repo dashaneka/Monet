@@ -1,4 +1,5 @@
 mod decoders;
+mod mpris;
 mod player;
 mod recent;
 mod resume;
@@ -9,7 +10,7 @@ mod window;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-const APP_ID: &str = "io.github.rajnish.Monet";
+pub const APP_ID: &str = "io.github.rajnish.Monet";
 
 fn main() -> glib::ExitCode {
     if let Err(err) = gst::init() {
