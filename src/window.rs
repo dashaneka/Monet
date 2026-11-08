@@ -242,11 +242,14 @@ fn recent_list(window: &adw::ApplicationWindow, slot: &Slot, items: &[gtk::Recen
                 let time = gst::ClockTime::from_seconds(position as u64);
                 format!("Resume at {}", player::format_time(time))
             }
-            None => file
-                .parent()
-                .and_then(|dir| dir.basename())
-                .map(|dir| dir.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            None => match file.parent() {
+                Some(dir) if dir.path() == Some(glib::home_dir()) => "Home".to_owned(),
+                Some(dir) => dir
+                    .basename()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                None => String::new(),
+            },
         };
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&item.display_name()))
