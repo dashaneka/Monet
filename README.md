@@ -31,6 +31,7 @@ Monet does one thing: plays your videos and gets out of the way. Built with Rust
 | `M` | Mute |
 | `A` | Next audio track |
 | `S` | Next subtitles (or off) |
+| `L` | Loop on / off |
 | `F` or double-click | Fullscreen |
 | `Esc` | Leave fullscreen |
 

@@ -77,6 +77,7 @@ pub struct Player {
     mute_button: gtk::Button,
     volume_scale: gtk::Scale,
     fullscreen_button: gtk::Button,
+    loop_button: gtk::ToggleButton,
     /// Reopens the same file at a position, after hardware decoding failed.
     reload: Box<dyn Fn(f64)>,
     state: RefCell<State>,
@@ -174,6 +175,13 @@ impl Player {
         volume_scale.set_value(1.0);
         volume_scale.set_width_request(100);
         let fullscreen_button = icon_button("view-fullscreen-symbolic", "Fullscreen");
+        let loop_button = gtk::ToggleButton::builder()
+            .icon_name("media-playlist-repeat-symbolic")
+            .tooltip_text("Loop")
+            .valign(gtk::Align::Center)
+            .build();
+        loop_button.add_css_class("flat");
+        loop_button.add_css_class("circular");
 
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.add_css_class("osd");
@@ -185,6 +193,7 @@ impl Player {
         controls.append(&position_label);
         controls.append(&seek_scale);
         controls.append(&duration_label);
+        controls.append(&loop_button);
         controls.append(&tracks_button);
         controls.append(&mute_button);
         let actions = gio::SimpleActionGroup::new();
@@ -252,6 +261,7 @@ impl Player {
             mute_button,
             volume_scale,
             fullscreen_button,
+            loop_button,
             reload: Box::new(reload),
             state: RefCell::default(),
         });
@@ -666,6 +676,7 @@ impl Player {
             gdk::Key::Down => self.change_volume(-VOLUME_STEP),
             gdk::Key::f => self.toggle_fullscreen(),
             gdk::Key::m => self.toggle_mute(),
+            gdk::Key::l => self.toggle_loop(),
             gdk::Key::Escape if self.window.is_fullscreen() => self.window.unfullscreen(),
             _ => return false,
         }
@@ -836,7 +847,7 @@ impl Player {
             ((next.id.clone(), next.label.clone()), state.subtitle.clone())
         };
         self.select_tracks(Some(next.0), subtitle);
-        self.announce_track(&format!("Audio: {}", next.1));
+        self.announce(&format!("Audio: {}", next.1));
     }
 
     /// Off, then each subtitle track in turn, then off again.
@@ -854,12 +865,12 @@ impl Player {
             (next.cloned(), state.audio.clone())
         };
         let label = next.as_ref().map_or("Off", |(_, label)| label.as_str());
-        self.announce_track(&format!("Subtitles: {label}"));
+        self.announce(&format!("Subtitles: {label}"));
         self.select_tracks(audio, next.map(|(id, _)| id));
     }
 
     /// One short message at a time, so quick presses don't queue up.
-    fn announce_track(&self, message: &str) {
+    fn announce(&self, message: &str) {
         let toast = adw::Toast::builder().title(message).timeout(2).build();
         if let Some(previous) = self.state.borrow_mut().track_toast.replace(toast.clone()) {
             previous.dismiss();
@@ -872,6 +883,13 @@ impl Player {
         if let Some(keys) = keys {
             self.window.remove_controller(&keys);
         }
+    }
+
+    fn toggle_loop(&self) {
+        let looping = !self.loop_button.is_active();
+        self.loop_button.set_active(looping);
+        self.announce(if looping { "Loop on" } else { "Loop off" });
+        self.show_controls();
     }
 
     fn toggle_mute(&self) {
@@ -1092,6 +1110,7 @@ impl Player {
                 }
                 self.fail(&err.error().to_string());
             }
+            gst::MessageView::Eos(_) if self.loop_button.is_active() => self.seek_to(0.0),
             gst::MessageView::Eos(_) => {
                 self.state.borrow_mut().ended = true;
                 self.set_playing(false);
